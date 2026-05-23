@@ -1,169 +1,157 @@
-# Blue-Green-Deployment on AWS
+---Automated CI/CD Pipeline with Jenkins & Blue-Green Deployment on AWS----
+
+Overview
+This project implements a fully automated CI/CD pipeline using Jenkins and GitHub, deploying a web application to AWS EC2 using a Blue-Green deployment strategy via AWS CodeDeploy and an Application Load Balancer (ALB).
+The goal was to eliminate manual deployments and reduce downtime during releases. With this pipeline, every push to the main branch automatically triggers a zero-downtime Blue-Green deployment — with instant rollback capability if the new version fails health checks.
+
+Architecture
+Developer pushes code
+        │
+        ▼
+   GitHub (main branch)
+        │  webhook (POST trigger)
+        ▼
+     Jenkins
+        │  build → test → deploy
+        ▼
+  AWS CodeDeploy
+        │
+        ▼
+Application Load Balancer (ALB)
+       / \
+      /   \
+     ▼     ▼
+  Blue     Green
+  EC2s     EC2s
+(standby) (new live)
+Flow:
+
+Code pushed to GitHub → webhook fires → Jenkins pipeline starts
+Jenkins builds the app and runs tests
+Jenkins triggers AWS CodeDeploy
+CodeDeploy deploys new version to Green EC2 instances
+ALB health checks pass → traffic switches from Blue → Green
+Blue becomes standby (instant rollback target)
+
+
+Tech Stack
+ToolPurposeJenkinsCI/CD orchestration, pipeline executionGitHubSource control + webhook triggerAWS CodeDeployDeployment automation + Blue-Green switchingAWS EC2Application hosting (Blue & Green environments)AWS ALBTraffic routing between Blue and GreenAWS IAMLeast-privilege permissions for Jenkins & CodeDeployAWS S3Artifact storage for deployment bundlesAWS SNSDeployment failure notifications
+
+Repository Structure
+├── Jenkinsfile                  # Pipeline definition (Build → Test → Deploy stages)
+├── appspec.yml                  # CodeDeploy lifecycle hooks configuration
+├── index.html                   # Application entry point
+└── scripts/
+    ├── install_dependencies.sh  # Runs on EC2 before deployment (BeforeInstall)
+    ├── start_server.sh          # Starts the application (ApplicationStart)
+    └── stop_server.sh           # Gracefully stops old version (BeforeInstall)
 
-Blue-green deployment is a technique that reduces downtime and risk by running two identical production environments called Blue and Green.
+Key Files Explained
+Jenkinsfile
+Defines 3 pipeline stages:
 
-At any time, only one of the environments is live, with the live environment serving all production traffic. For this example, Blue is currently live, and Green is idle.
-As you prepare a new version of your software, deployment and the final stage of testing takes place in the environment that is not live: in this example, Green. 
-Once you have deployed and fully tested the software in Green, you switch the router, so all incoming requests now go to Green instead of Blue. Green is now live, and Blue is idle.
+Build — packages application artifacts
+Test — runs health/smoke tests
+Deploy — invokes AWS CodeDeploy to trigger Blue-Green deployment
 
-This technique can eliminate downtime due to app deployment. In addition, blue-green deployment reduces risk: if something unexpected happens with your new version on Green, you can immediately roll back to the last version by switching back to Blue.
+appspec.yml
+CodeDeploy configuration file that maps lifecycle hooks:
+yamlversion: 0.0
+os: linux
+files:
+  - source: /
+    destination: /var/www/html
+hooks:
+  BeforeInstall:
+    - location: scripts/install_dependencies.sh
+  ApplicationStart:
+    - location: scripts/start_server.sh
+  ApplicationStop:
+    - location: scripts/stop_server.sh
+scripts/install_dependencies.sh
+Installs Apache and CodeDeploy agent on the target EC2. Also ensures codedeploy-agent is enabled on reboot via systemctl enable.
 
-![Intro](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/Capture.PNG)
+Blue-Green Deployment Strategy
+AspectDetailWhy Blue-Green?Keeps two identical environments — zero risk during releaseTraffic switchALB listener rules updated by CodeDeploy — instant cutoverRollback time< 2 minutes — just point ALB back to Bluevs RollingRolling has mixed-version window; Blue-Green never doesDowntimeZero — ALB switches only after Green passes health checks
 
+IAM Setup (Least Privilege)
+Two IAM roles created:
+Jenkins IAM User — permissions:
 
+codedeploy:CreateDeployment
+codedeploy:GetDeployment
+s3:PutObject (artifact upload)
+ec2:DescribeInstances
 
-Blue/Green is a deployment strategy that has been around forever and can be implemented using a variety of methods, CI-CD being one of the popular ones. Other methods include Chef, Ansible.
+CodeDeploy Service Role — permissions:
 
-So basically, CI-CD is a tool to implement strategy of Blue-Green Deployment.
+AWSCodeDeployRole managed policy
+EC2 describe + tag access
 
-In this excercise, we will deploy application in Blue-Green environment on the AWS platform using services and tools like CodeDeploy for deployment, GitHub for storing application source code, and Jenkins for creating a build of source code, and triggering deployment on CodeDeploy.
 
-What you will need in this lab:
-•	AWS account
+Jenkins Configuration
 
-•	Virtual Machine
+Plugin: GitHub plugin + AWS CodeDeploy plugin
+Credentials: AWS keys stored in Jenkins Credentials Manager (never hardcoded)
+Trigger: GitHub webhook on push to main branch
+Notifications: SNS alert on deployment failure
 
-•	GitHub 
 
-•	Jenkins
+Problems Faced & How I Fixed Them
+Problem 1: CodeDeploy agent not running after EC2 reboot
 
-**PART 1: PERMISSIONS**
+Deployments were silently failing on restarted instances
+Fix: Added systemctl enable codedeploy-agent to install_dependencies.sh so agent starts on every boot
 
-STEP 1: Create a new user with permissions to fully access EC2, AutoScaling. CodeDeploy, and S3.
+Problem 2: Jenkins webhook not triggering on push
 
-STEP 2: Create S3 bucket with versioning enabled
+GitHub webhook was returning 302 redirect
+Fix: Corrected Jenkins URL in webhook settings to include /github-webhook/ trailing slash
 
-In CodeDeploy, identity-based policies are used to manage permissions to the various resources related to the deployment process. For doing so:
+Problem 3: ALB health checks failing on Green environment
 
-STEP 3: Navigate to IAM and create a new policy in JSON name as CodeDeployPerm and paste the following: Replace your s3 bucket name in resource 
+Apache wasn't starting fast enough before health check hit
+Fix: Added a 30-second sleep in start_server.sh and increased ALB health check grace period
 
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Action": [
-                "s3:Get*",
-                "s3:List*"
-            ],
-            "Effect": "Allow",
-            "Resource": "arn:aws:s3:::<your-bucket-name>"
-        }
-    ]
-}
 
+Results
+MetricBeforeAfterDeployment time30-45 min (manual)~5 min (automated)Downtime per release10-15 minutes0 minutesRollback time1-2 hours< 2 minutesHuman error riskHighEliminated
 
-STEP 4: Create a new role (select EC2 service) with following policies attached
+How to Run This Project
+Prerequisites
 
-![Bg-1](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/BG-1.png)
+AWS account with EC2, CodeDeploy, ALB, S3, IAM access
+Jenkins server running on EC2 (port 8080)
+GitHub repository with webhook configured
 
-STEP 5: Create another role for CodeDeploy
+Steps
 
-![Bg-2](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/BG-2.png)
+Fork this repo and configure your GitHub webhook to point to http://<jenkins-ec2-ip>:8080/github-webhook/
+Create two EC2 Auto Scaling Groups — one for Blue, one for Green — registered to separate ALB target groups
+Create CodeDeploy Application:
 
-**PART 2: EC2 INSTANCES**
+   Platform: EC2/On-premises
+   Deployment Type: Blue/Green
+   Load Balancer: Your ALB
+   Deployment Config: CodeDeployDefault.OneAtATime
 
-STEP 1: Create a new EC2 instance and for IAM role select the EC2 role we created earlier
+Configure Jenkins:
 
-STEP 2: Put the following in user data while creating EC2: *(make sure to change your region if you are not in us-east-2)*
+Install GitHub + AWS CodeDeploy plugins
+Add AWS credentials to Jenkins Credentials Manager
+Create Pipeline job pointing to this repo's Jenkinsfile
 
-#!/bin/bash
-yum update -y
-yum install ruby -y
-yum install aws-cli -y
-yum install -y httpd 
-cd /home/ec2-user/
-aws s3 cp s3://aws-codedeploy-us-east-2/latest/install . --region us-east-2
-chmod +x ./install
-./install auto
 
-The above list of commands will deploy all the dependencies inluding CodeDeploy agent needed by the instance to be used in CodeDeploy deployments.
+Push to main — pipeline triggers automatically
 
-STEP 3: Create a new security group with following rules:
 
-![Bg-3](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/BG-3.png)
+Lessons Learned
 
-We are alowing port 8080 because Jenkins uses that port to communicate.
+Blue-Green is more expensive (double EC2 cost) but worth it for production workloads where downtime = lost revenue
+Always enable codedeploy-agent on boot — not just install it
+Least-privilege IAM from day one saves debugging time later
+Jenkins webhook failures are almost always a trailing slash issue
 
-STEP 4: Create a new Application Load Balancer
 
-We are using Application Load Balancer(ALB) so that we can configure multiple listener rules by choosing our instances as Target groups. Because of ALB, we do not need to maintain separate instances for both Blue and Green environment.
-
-
-Start creating ALB and choose the security group we created earlier, register our instances to Targets, and create it.
-
-
-STEP 5: Create a template from our EC2 instance *(Choose VPC for Networking Platform and select the Security Group we have created)
-
-
-Now that our EC2 instances has the required dependencies in it, ALB attached and we want the same configuration for all our instances so are creating a template from our instance so that everything our instance has, will be present in the template and we will use this template to create an Auto-Scaling Group in next step. 
-
-
-STEP 6: Creating an Auto-Scaling group
-
-Here we create an AS group using the template that we created in the previous step. Enable Load Balancing and select out Target Group
-
-Based on the size that we of an Auto Scaling group is determined by the number of instances set in the desired capacity field, these can be set manually or by using automatic scaling. An Auto Scaling starts by launching desired number of instances, it maintains this number of instances by performing periodic health checks, if an instance becomes unhealthy, it replaces that unhealthy instance with another instance.
-
-**PART 3: AWS CodeDeploy**
-
-STEP 1: We will create a new application on AWS CodeDeploy  
-
-Choose EC2/On premises as compute platform, CodeDeploy Service role that we created earlier.
-
-In the Deployment type, select Blue-Green Deployment, choose the ALB we had created in Part 1, Deployment Configuration as CodeDeployDefault.OneAtATime and create the Deployment Group
-
-
-**PART 4: GITHUB**
-
-STEP 1: Create a new repository on GitHub, create a new folder called as scripts and write 3 files in the way I have added in this repository
-
-
-STEP 2: Create an appspec.yml file and index.html file in your repo as following (Not inside the scripts folder)
-
-
-**PART 5: JENKINS**
-
-In this exercise, we are going to use Jenkins to create our source build and create deployment
-
-STEP 1: Install Jenkins on your Virtual Machine (Follow official Jenkins installation guide for steps)
-
-
-STEP 2: We simply need to use the IP of our Jenkins server, which in this case is 192.168.1.28 and add a port 8080 after the IP address to open the Jenkins GUI (192.168.1.28:8080)
-
-
-STEP 3: Creating a new job on Jenkins (Use freestyle project)
-
-
-STEP 4: For Source Code Management, choose Git and add your repository link
-
-
-STEP 5: : Select a Post-Build job as Deploy application to CodeDeploy and enter all AWS CodeDeploy details as well as S3 bucket and IAM Credentials 
-
-Successful output:
-
-![Bg-5](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/BG-6.png)
-
-
-STEP 6: Now go back to AWS Console and check for Deployment
-
-![Bg-4](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/BG-4.png)
-
-
-Successful output:
-
-![Bg-5](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/BG-5.png)
-
-
-
-STEP 7: Now go to your Load Balancer and check whether the traffic has shifted
-
-
-SUccessful output:
-
-![Bg-7](https://github.com/roshnii20/Blue-Green-Deployment/blob/main/Pictures/BG-7.PNG)
-
-
-Now you can make any changes to your index.html file and use Jenkins to trigger it.
-
-
-***End***
+Connect
+If you're working on similar DevOps projects or have questions about this implementation, feel free to reach out!
